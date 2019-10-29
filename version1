@@ -1,0 +1,361 @@
+  /*
+   * This code does 3 basic things.
+   * 
+   * 1. It reads the temperature from four TMP36 analogue sensors. This reading
+   * compares to the internal 2,56 volt reference and the sensors are fed by an
+   * LP2950 3,3 volt regulator connected to the Arduino Mega 2560's internal 5 
+   * volt. If the TMP36 sensors would measure 125 degrees Celsius they would produce
+   * 1,75 volt on their vout pin but that it theory as I am not planning to
+   * measure higher temperatires then around 60 C which would translate to 1,1 volt.
+   * The analogue pins reads this voltage by get a value between 0 and 1024. The code
+   * converts this value to degrees Celsius by dividing the reference voltage which I
+   * measuered to 2577 mV with 1024 and then subtracting 500 mV and then divide the
+   * lot with 10. The degrees Celsius I will be able to display on an LCD or whatever.
+   * However I also do a copy of the ADC-pin reading and constrain this value to
+   * inbetween 300 and 450 which represents about 25 to 63 degrees Celsius. This value
+   * I put a map algorithm that do a linear conversion of the temp value to a value
+   * that I use for setting the fan contol pins duty cycle between 20 and 320.
+   * 
+   * 2. It produces a 25 kHz 5 volt p-p squarewave signal on four pins that can be 
+   * modulated in duty cycle between 0 and 100%. Those pins controls one 12 volt 
+   * PWM fan each. The duty cycle value is set by the map algorithm described above. 
+   * I use pin 11 and 12 controlled by timer 1 and 5 and 2 controlled by timer 3
+   * for this.
+   * 
+   * 2. It reads the length of the DC fans built in hall sensor(s) activity.
+   * The readings are in microseconds and with a formula this can be converted
+   * and presented as Revolutions Per Minute (RPM) and/or percentage spinning
+   * of the fans max revolutions per time unit. To avoid to much flickering when
+   * displaying this value it runs to a smoothing algorithm as well that adds the
+   * last four measurements and displays that total value divided by 4.
+   * I tested to use the internal built in 20k pullup resistors but the microamp
+   * current is not enough for stable readings so instead I use external 2,4 k
+   * resistors that gives around 2 mA of current per pin. This current gets shorted
+   * to ground by the fans internal mosfets that takes the reading from high to low
+   * two times per revolution. Noctua recommends up to 5 mA in their specs.
+   * 
+   * PS. In my first versions of the code I tried working with arrays as long as
+   * possible but I ran in to problem when trying to attatch the OCR duty cycle
+   * values to the PWM values in an array so I rewrote it all to straight code,
+   * hence the length of it all since I do everything four times in the code.
+  */
+
+const int tmpPin0 = A12;          // Temp pin assignments
+const int tmpPin1 = A13;
+const int tmpPin2 = A14;
+const int tmpPin3 = A15;
+
+const int pwmPin0 = 11;           // PWM pin assignments
+const int pwmPin1 = 12;
+const int pwmPin2 = 5;
+const int pwmPin3 = 2;
+
+const int hallSensorPin0 = 13;    // Hall sensor pin assignments
+const int hallSensorPin1 = 9;
+const int hallSensorPin2 = 22;
+const int hallSensorPin3 = 23;
+
+int tmpReading0;                  // Variables for the temp
+int tmpReading1;                  // sensor Readings
+int tmpReading2;
+int tmpReading3;
+
+int tmpConstr0;                   // Variables for the temp
+int tmpConstr1;                   // sensor Voltages
+int tmpConstr2;
+int tmpConstr3;
+
+int tmpDegree0;                   // Variables for temp
+int tmpDegree1;                   // sensor Degrees Celsius
+int tmpDegree2;
+int tmpDegree3;
+
+int pwm1A = 120;                  // Variables for the duty
+int pwm1B = 120;                  // cycles (0-320 = 0-100%)
+int pwm3A = 120;                  // Boot up values 120
+int pwm3B = 120;
+
+unsigned long highPulseTime0;     // Variables for the durations
+unsigned long highPulseTime1;     // of the high pulses
+unsigned long highPulseTime2;
+unsigned long highPulseTime3;
+
+unsigned long lowPulseTime0;      // Variables for the durations
+unsigned long lowPulseTime1;      // of the low pulses
+unsigned long lowPulseTime2;
+unsigned long lowPulseTime3;
+
+unsigned long newPulseTime0;      // Variables for the durations
+unsigned long newPulseTime1;      // of the new pulses
+unsigned long newPulseTime2;
+unsigned long newPulseTime3;
+
+int revsPerMinute0;               // Variables for RPM values
+int revsPerMinute1;               // calculated from the pulse times
+int revsPerMinute2;
+int revsPerMinute3;
+
+int smoothedRevsPerMinute0;       // Variables for the
+int smoothedRevsPerMinute1;       // smoothed RPM values
+int smoothedRevsPerMinute2;
+int smoothedRevsPerMinute3;
+
+int percentage0;                  // Variables for percentage value
+int percentage1;                  // calculated from their RPM values
+int percentage2;                  // and their max RPM values
+int percentage3;
+
+const int samples = 4;            // No of samples used for smoothing
+
+const int maxRevFan0 = 1140;      // Constants for each fans maximum 
+const int maxRevFan1 = 1570;      // revs per minute
+const int maxRevFan2 = 2180;
+const int maxRevFan3 = 1550;
+
+void setup() {
+
+// Use the internal 2,56 volt reference as Vref
+  analogReference(INTERNAL2V56);
+
+  pinMode(tmpPin0, INPUT);        // Tell the Temp pins
+  pinMode(tmpPin1, INPUT);        // to be inputs
+  pinMode(tmpPin2, INPUT);
+  pinMode(tmpPin3, INPUT); 
+
+  pinMode(pwmPin0, OUTPUT);       // Tell the PWM pins to
+  pinMode(pwmPin1, OUTPUT);       // be outputs
+  pinMode(pwmPin2, OUTPUT);
+  pinMode(pwmPin3, OUTPUT);
+
+  pinMode(hallSensorPin0, INPUT); // Tell the Hall Sensor
+  pinMode(hallSensorPin1, INPUT); // pins to be inputs
+  pinMode(hallSensorPin2, INPUT);
+  pinMode(hallSensorPin3, INPUT);
+
+// Timer 1 PWM settings
+
+  TCCR1A = 0;                     // Clear timer registers
+  TCCR1B = 0;
+  TCNT1 = 0;
+
+  TCCR1B |= _BV(CS10);            // No prescaler
+  ICR1 = 320;                     // PWM mode counts up 320 then down
+                                  // 320 counts (25kHz)
+
+  OCR1A = pwm1A;                  // 0-320 = 0-100% duty cycle
+  TCCR1A |= _BV(COM1A1);          // output A clear rising/set falling
+
+  OCR1B = pwm1B;                  // 0-320 = 0-100% duty cycle
+  TCCR1A |= _BV(COM1B1);          // output B clear rising/set falling
+
+  TCCR1B |= _BV(WGM13);           // PWM mode with ICR1 Mode 10
+  TCCR1A |= _BV(WGM11);           // WGM13:WGM10 set 1010
+
+// Timer 3 PWM settings
+
+  TCCR3A = 0;                     // Clear timer registers
+  TCCR3B = 0;  
+  TCNT3 = 0;
+
+  TCCR3B |= _BV(CS10);            // No prescaler
+  ICR3 = 320;                     // PWM mode counts up 320 then down
+                                  // 320 counts (25kHz)
+
+  OCR3A = pwm3A;                  // 0-320 = 0-100% duty cycle
+  TCCR3A |= _BV(COM1A1);          // Output A clear rising/set falling
+
+  OCR3B = pwm3B;                  // 0-320 = 0-100% duty cycle
+  TCCR3A |= _BV(COM1B1);          // Output B clear rising/set falling
+
+  TCCR3B |= _BV(WGM13);           // PWM mode with ICR1 Mode 10
+  TCCR3A |= _BV(WGM11);           // WGM13:WGM10 set 1010  
+  
+  Serial.begin(9600);             // Start a serial for debugging readouts 
+  
+
+delay(5000);                      // System start delay
+  
+}
+
+void loop() {
+
+// Read the analog pins for temp values
+  tmpReading0 = analogRead(tmpPin0);
+  tmpReading1 = analogRead(tmpPin1);
+  tmpReading2 = analogRead(tmpPin2);
+  tmpReading3 = analogRead(tmpPin3);
+
+// Recalculate the readings to Degrees Celsius
+  tmpDegree0 = ((tmpReading0 * (2577 / 1024.0) - 500) / 10);
+  tmpDegree1 = ((tmpReading1 * (2577 / 1024.0) - 500) / 10);
+  tmpDegree2 = ((tmpReading2 * (2577 / 1024.0) - 500) / 10);
+  tmpDegree3 = ((tmpReading3 * (2577 / 1024.0) - 500) / 10);
+
+// Create a constrained reading for fan controll
+  tmpConstr0 = tmpReading0;
+  tmpConstr1 = tmpReading1;
+  tmpConstr2 = tmpReading2;
+  tmpConstr3 = tmpReading3;
+
+// Constrains percentage scale to stay within 0 and 100
+  tmpConstr0 =  constrain(tmpConstr0, 300, 450);  
+  tmpConstr1 =  constrain(tmpConstr1, 300, 450);
+  tmpConstr2 =  constrain(tmpConstr2, 300, 450);
+  tmpConstr3 =  constrain(tmpConstr3, 300, 450);
+
+// Create a value between 20 and 320 from the temp readings
+  pwm1A = map(tmpConstr0, 300, 450, 20, 320);
+  pwm1B = map(tmpConstr1, 300, 450, 20, 320);
+  pwm3A = map(tmpConstr2, 300, 450, 20, 320);
+  pwm3B = map(tmpConstr3, 300, 450, 20, 320);
+
+// Tell the duty cycle parameter to adapt to the created value
+  OCR1A = pwm1A;
+  OCR1B = pwm1B;
+  OCR3A = pwm3A;
+  OCR3B = pwm3B; 
+
+//  Catch the high pulse durations with the pulseIn command
+  highPulseTime0 = pulseIn(hallSensorPin0, HIGH);
+  highPulseTime1 = pulseIn(hallSensorPin1, HIGH);
+  highPulseTime2 = pulseIn(hallSensorPin2, HIGH);
+  highPulseTime3 = pulseIn(hallSensorPin3, HIGH);
+
+//  Catch the low pulse durations with the pulseIn command
+  lowPulseTime0 = pulseIn(hallSensorPin0, LOW);
+  lowPulseTime1 = pulseIn(hallSensorPin1, LOW);
+  lowPulseTime2 = pulseIn(hallSensorPin2, LOW);
+  lowPulseTime3 = pulseIn(hallSensorPin3, LOW);
+
+//  Add respective high pulses to respective low pulses
+  newPulseTime0 = highPulseTime0 + lowPulseTime0;
+  newPulseTime1 = highPulseTime1 + lowPulseTime1;
+  newPulseTime2 = highPulseTime2 + lowPulseTime2;
+  newPulseTime3 = highPulseTime3 + lowPulseTime3;
+
+//  Calculate revs per minute with total pulse times
+  revsPerMinute0 = (1000000 * 60)/(newPulseTime0 *2);
+  revsPerMinute1 = (1000000 * 60)/(newPulseTime1 *2);
+  revsPerMinute2 = (1000000 * 60)/(newPulseTime2 *2);
+  revsPerMinute3 = (1000000 * 60)/(newPulseTime3 *2);
+
+//  Smooth out the readings by dividing the last four samples
+  smoothedRevsPerMinute0 = smoothedRevsPerMinute0 
+    + ((revsPerMinute0 - smoothedRevsPerMinute0)/samples);
+  smoothedRevsPerMinute1 = smoothedRevsPerMinute1 
+    + ((revsPerMinute1 - smoothedRevsPerMinute1)/samples);
+  smoothedRevsPerMinute2 = smoothedRevsPerMinute2 
+    + ((revsPerMinute2 - smoothedRevsPerMinute2)/samples);
+  smoothedRevsPerMinute3 = smoothedRevsPerMinute3 +
+    ((revsPerMinute3 - smoothedRevsPerMinute3)/samples);
+
+// Calculate the fans spinning in percentage of its max
+  percentage0 = (smoothedRevsPerMinute0 
+    / (maxRevFan0/100));
+  percentage1 = (smoothedRevsPerMinute1 
+    / (maxRevFan1/100));
+  percentage2 = (smoothedRevsPerMinute2 
+    / (maxRevFan2/100));
+  percentage3 = (smoothedRevsPerMinute3 
+    / (maxRevFan3/100));
+
+// Constrains percentage scale to stay within 0 and 100
+  percentage0 =  constrain(percentage0, 0, 100);  
+  percentage1 =  constrain(percentage1, 0, 100);
+  percentage2 =  constrain(percentage2, 0, 100);
+  percentage3 =  constrain(percentage3, 0, 100);
+    
+
+// Print things to monitor for test purpouses
+
+  Serial.print("RPM Fan 1");
+  Serial.print("\t");
+  Serial.print("\t");
+  Serial.println(smoothedRevsPerMinute0, DEC);
+
+  Serial.print("Percentage Fan 1");
+  Serial.print("\t");
+  Serial.println(percentage0, DEC);  
+
+  Serial.print("PWM Fan 1");
+  Serial.print("\t");
+  Serial.print("\t");
+  Serial.println(pwm1A, DEC);
+
+  Serial.print("Temp reading");
+  Serial.print("\t");
+  Serial.print("\t");
+  Serial.println(tmpReading0, DEC);
+
+  Serial.println();
+
+  Serial.print("RPM Fan 2");
+  Serial.print("\t");
+  Serial.print("\t");
+  Serial.println(smoothedRevsPerMinute1, DEC);
+
+  Serial.print("Percentage Fan 2");
+  Serial.print("\t");
+  Serial.println(percentage1, DEC); 
+
+  Serial.print("PWM Fan 2");
+  Serial.print("\t");
+  Serial.print("\t");
+  Serial.println(pwm1B, DEC);
+
+  Serial.print("Temp reading");
+  Serial.print("\t");
+  Serial.print("\t");
+  Serial.println(tmpReading1, DEC);
+
+
+  Serial.println();
+
+  Serial.print("RPM Fan 3");
+  Serial.print("\t");
+  Serial.print("\t");
+  Serial.println(smoothedRevsPerMinute2, DEC);
+
+  Serial.print("Percentage Fan 3");
+  Serial.print("\t");
+  Serial.println(percentage2, DEC); 
+
+  Serial.print("PWM Fan 3");
+  Serial.print("\t");
+  Serial.print("\t");
+  Serial.println(pwm3A, DEC);
+
+  Serial.print("Temp reading");
+  Serial.print("\t");
+  Serial.print("\t");
+  Serial.println(tmpReading2, DEC);
+
+
+  Serial.println();    
+
+  Serial.print("RPM Fan 4");
+  Serial.print("\t");
+  Serial.print("\t");
+  Serial.println(smoothedRevsPerMinute3, DEC);    
+
+  Serial.print("Percentage Fan 4");
+  Serial.print("\t");
+  Serial.println(percentage3, DEC); 
+
+  Serial.print("PWM Fan 4");
+  Serial.print("\t");
+  Serial.print("\t");
+  Serial.println(pwm3B, DEC);
+
+  Serial.print("Temp reading");
+  Serial.print("\t");
+  Serial.print("\t");
+  Serial.println(tmpReading3, DEC);
+
+
+  Serial.println();
+  Serial.println();  
+
+  delay(3000);
+ 
+}
